@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Web;
 using System.Web.Mvc;
+using KeycloakAuth.Helper;
 
 namespace KeycloakAuth.Controllers
 {
@@ -13,7 +14,7 @@ namespace KeycloakAuth.Controllers
             return View();
         }
        
-        [Authorize]
+        [ExirAuthorize]
         public ActionResult About()
         {
             ViewBag.Message = "Your application description page.";

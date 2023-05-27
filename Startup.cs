@@ -5,8 +5,12 @@ using System.Globalization;
 using System.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
 using System.Net.Http;
+using System.Security.Authentication;
 using System.Security.Claims;
 using System.Threading.Tasks;
+using System.Web.Configuration;
+using IdentityModel;
+using IdentityModel.Client;
 using Microsoft.AspNet.Identity;
 using Microsoft.Identity.Client;
 using Microsoft.IdentityModel.Logging;
@@ -31,67 +35,89 @@ namespace KeycloakAuth
         public void Configuration(IAppBuilder app)
         {
             IdentityModelEventSource.ShowPII = true;
-            // Configure the middleware to use Keycloak for authentication
-            JwtSecurityTokenHandler.DefaultInboundClaimTypeMap.Clear();
-            app.SetDefaultSignInAsAuthenticationType(CookieAuthenticationDefaults.AuthenticationType);
+            JwtSecurityTokenHandler.DefaultInboundClaimTypeMap = new Dictionary<string, string>();
+
             app.UseCookieAuthentication(new CookieAuthenticationOptions
             {
-                AuthenticationType = CookieAuthenticationDefaults.AuthenticationType
+                AuthenticationType = "oidc",
+                ExpireTimeSpan = TimeSpan.FromMinutes(30),
+                SlidingExpiration = true
             });
+
             app.UseOpenIdConnectAuthentication(new OpenIdConnectAuthenticationOptions
             {
+                
                 Authority = ConfigurationManager.AppSettings["KeycloakUrl"],
-                ClientId = ConfigurationManager.AppSettings["KeycloakClientId"],
-                //ClientSecret = ConfigurationManager.AppSettings["KeycloakClientSecret"],
-                RedirectUri = "http://localhost:4000/",
-                ResponseType = OpenIdConnectResponseType.CodeIdTokenToken,
-//                Scope = OpenIdConnectScope.OpenIdProfile,
-                Scope ="openid phone microprofile-jwt roles profile web-origins offline_access email address",
-                UseTokenLifetime = true,
                 RequireHttpsMetadata = false,
-                SignInAsAuthenticationType = CookieAuthenticationDefaults.AuthenticationType,
-                TokenValidationParameters = new TokenValidationParameters
-                {
-                    NameClaimType = "preferred_username",
-                    ValidateIssuer = false
-                },
+                ClientId = ConfigurationManager.AppSettings["KeycloakClientId"],
+                //ClientSecret = WebConfigurationManager.AppSettings["clientSecret"].ToString(),
+                ResponseType = OpenIdConnectResponseType.CodeIdTokenToken,
+                Scope ="openid attribute microprofile-jwt roles profile web-origins email address phone",
+                RedirectUri = "http://localhost:4000/",
+                PostLogoutRedirectUri = "http://localhost:4000/",
+                UseTokenLifetime = true,
+                SignInAsAuthenticationType = "oidc",
+                AuthenticationType = "oidc",                
+                RefreshOnIssuerKeyNotFound = false,
+                
                 Notifications = new OpenIdConnectAuthenticationNotifications
                 {
-                    SecurityTokenValidated = async n =>
+                    AuthorizationCodeReceived = async n =>
                     {
-                        // var userInfoClient = new UserInfoClient(
-                        //     new Uri(n.Options.Authority + "/realms/" +
-                        //             ConfigurationManager.AppSettings["KeycloakRealm"] +
-                        //             "/protocol/openid-connect/userinfo"));
-                        // var userInfo = await userInfoClient.GetAsync(
-                        //     new UserInfoRequest { Token = n.ProtocolMessage.AccessToken });
+                        var client = new HttpClient();
+                        AuthorizationCodeTokenRequest codeTokenRequest = new AuthorizationCodeTokenRequest
+                        { 
+                            Address =  n.Options.Authority + "protocol/openid-connect/token",
+                            ClientId = ConfigurationManager.AppSettings["KeycloakClientId"],
+                            //ClientSecret = WebConfigurationManager.AppSettings["clientSecret"].ToString(),
+                            Code = n.Code,
+                            RedirectUri = n.RedirectUri
+                        };
+                        var tokenResponse = await client.RequestAuthorizationCodeTokenAsync(codeTokenRequest);
+                        if (tokenResponse.IsError)
+                        {
+                            throw new AuthenticationException(tokenResponse.Error);
+                        }
+                        UserInfoRequest userInfoRequest = new UserInfoRequest
+                        {
+                            Address = n.Options.Authority + "protocol/openid-connect/userinfo",
+                            Token = tokenResponse.AccessToken
+                        };
+                        
+                        var userInfoResponse = await client.GetUserInfoAsync(userInfoRequest);
+                        
+                        var id = new ClaimsIdentity(n.AuthenticationTicket.Identity.AuthenticationType);
+                        id.AddClaims(userInfoResponse.Claims);
 
-                        var identity = new ClaimsIdentity(
-                            n.AuthenticationTicket.Identity.AuthenticationType);
-                        identity.AddClaims(n.AuthenticationTicket.Identity.Claims);
-                        identity.AddClaim(new Claim("access_token", n.ProtocolMessage.AccessToken));
-                        identity.AddClaim(new Claim("expires_at",
-                            DateTimeOffset.Now.AddSeconds(int.Parse(n.ProtocolMessage.ExpiresIn))
-                                .ToString("o", CultureInfo.InvariantCulture)));
-                        //identity.AddClaim(new Claim("refresh_token", n.ProtocolMessage.RefreshToken));
-                        identity.AddClaim(new Claim("id_token", n.ProtocolMessage.IdToken));
+                        id.AddClaim(new Claim("access_token", tokenResponse.AccessToken));
+                        id.AddClaim(new Claim("expires_at", DateTime.Now.AddSeconds(tokenResponse.ExpiresIn).ToLocalTime().ToString(CultureInfo.InvariantCulture)));
+                        id.AddClaim(new Claim("refresh_token", tokenResponse.RefreshToken));
+                        id.AddClaim(new Claim("id_token", n.ProtocolMessage.IdToken));
+                        id.AddClaim(new Claim("sid", n.AuthenticationTicket.Identity.FindFirst("sid").Value));
 
                         n.AuthenticationTicket = new AuthenticationTicket(
-                            identity, n.AuthenticationTicket.Properties);
+                            new ClaimsIdentity(id.Claims, n.AuthenticationTicket.Identity.AuthenticationType, JwtClaimTypes.Name, JwtClaimTypes.Role),
+                            n.AuthenticationTicket.Properties
+                        );
+
+
                     },
                     RedirectToIdentityProvider = n =>
                     {
-                        if (n.ProtocolMessage.RequestType ==  Microsoft.IdentityModel.Protocols.OpenIdConnect.OpenIdConnectRequestType.Logout)
+                        if (n.ProtocolMessage.RequestType !=  Microsoft.IdentityModel.Protocols.OpenIdConnect.OpenIdConnectRequestType.Logout)
                         {
-                            var idTokenHint = n.OwinContext.Authentication
-                                .User.FindFirst("id_token").Value;
+                            return Task.FromResult(0);
+                        }
 
-                            n.ProtocolMessage.IdTokenHint = idTokenHint;
-                            n.ProtocolMessage.PostLogoutRedirectUri =
-                                ConfigurationManager.AppSettings["KeycloakPostLogoutRedirectUri"];
+                        var idTokenHint = n.OwinContext.Authentication.User.FindFirst("id_token");
+
+                        if (idTokenHint != null)
+                        {
+                            n.ProtocolMessage.IdTokenHint = idTokenHint.Value;
                         }
 
                         return Task.FromResult(0);
+
                     }
                 }
             });
